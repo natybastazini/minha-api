@@ -1,20 +1,21 @@
-# Pipeline completo: Testes -> Imagem no Docker Hub -> Deploy na EC2
+# Pipeline: Testes -> Imagem -> Deploy HOMOL (develop) / Deploy PRD (main, com aprovacao)
 name: CI/CD
 
-# Quando o pipeline roda
 on:
   push:
-    branches: [main]
+    branches: [develop, main]
   pull_request:
     branches: [main]
 
+env:
+  IMAGE_NAME: senai_fastapi
+
 jobs:
-  # JOB 1: instala as dependências e roda os testes
   Build:
     name: Compilar Projeto
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout do código
+      - name: Checkout do codigo
         uses: actions/checkout@v4
 
       - name: Configurar Python
@@ -22,7 +23,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Instalar dependências
+      - name: Instalar dependencias
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
@@ -31,15 +32,13 @@ jobs:
       - name: Executar testes com pytest
         run: PYTHONPATH=. pytest tests/ -v --tb=short
 
-  # JOB 2: constrói a imagem e publica no Docker Hub
   Imagem:
     name: Construindo Imagem para Docker
     runs-on: ubuntu-latest
     needs: Build
-    # só publica em push, não em pull request
     if: github.event_name == 'push'
     steps:
-      - name: Checkout do código
+      - name: Checkout do codigo
         uses: actions/checkout@v4
 
       - name: Login no Docker Hub
@@ -53,42 +52,60 @@ jobs:
         with:
           context: .
           push: true
-          # usa o seu usuário do Docker Hub pelo secret
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/senai_fastapi:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/senai_fastapi:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.ref_name == 'main' && 'latest' || 'homolog' }}
 
-  # JOB 3: conecta na EC2 por SSH e sobe o container novo
-  Deploy:
-    name: Implantação AWS
+  Deploy_Homologacao:
+    name: Deploy HOMOL
     runs-on: ubuntu-latest
     needs: Imagem
+    if: github.ref == 'refs/heads/develop'
+    environment: homologacao
     steps:
-      - name: Deploy via SSH na EC2
+      - name: Deploy via SSH na EC2 de homologacao
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            # Baixa a imagem nova
-            sudo docker pull ${{ secrets.DOCKERHUB_USERNAME }}/senai_fastapi:latest
-
-            # Para e remove o container atual (ignora erro se não existir)
-            sudo docker stop senai_fastapi 2>/dev/null || true
-            sudo docker rm senai_fastapi 2>/dev/null || true
-
-            # Sobe o container novo
+            sudo docker pull ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:homolog
+            sudo docker stop ${{ env.IMAGE_NAME }} 2>/dev/null || true
+            sudo docker rm ${{ env.IMAGE_NAME }} 2>/dev/null || true
             sudo docker run -d \
-              --name senai_fastapi \
+              --name ${{ env.IMAGE_NAME }} \
               --restart unless-stopped \
               -p 8080:8080 \
-              ${{ secrets.DOCKERHUB_USERNAME }}/senai_fastapi:latest
-
-            # Health check pós-deploy
+              ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:homolog
             sleep 5
             curl -f http://localhost:8080/health || exit 1
-            echo "Deploy concluído com sucesso!"
+            echo "Deploy HOMOL concluido com sucesso!"
+            sudo docker image prune -f
 
-            # Remove imagens antigas para economizar disco
+  Deploy_Producao:
+    name: Deploy PRD
+    runs-on: ubuntu-latest
+    needs: Imagem
+    if: github.ref == 'refs/heads/main'
+    environment: producao
+    steps:
+      - name: Deploy via SSH na EC2 de producao
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            sudo docker pull ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+            sudo docker stop ${{ env.IMAGE_NAME }} 2>/dev/null || true
+            sudo docker rm ${{ env.IMAGE_NAME }} 2>/dev/null || true
+            sudo docker run -d \
+              --name ${{ env.IMAGE_NAME }} \
+              --restart unless-stopped \
+              -p 8080:8080 \
+              ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+            sleep 5
+            curl -f http://localhost:8080/health || exit 1
+            echo "Deploy PRD concluido com sucesso!"
             sudo docker image prune -f
